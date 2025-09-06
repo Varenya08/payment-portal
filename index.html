@@ -1,0 +1,947 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Multi-currency Router — Demo UI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, Arial; max-width: 920px; margin: 18px auto; padding: 12px; }
+    header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    h1 { margin: 0; font-size: 20px; }
+    .card { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; margin-top:12px; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
+    label { display:block; margin-top:8px; font-weight:600; font-size:13px; }
+    input, button, select { padding:8px; margin-top:6px; width:100%; box-sizing:border-box; border-radius:6px; border:1px solid #cbd5e1; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .col { flex:1 1 240px; min-width:200px; }
+    button { cursor:pointer; background:#2563eb; color:white; border: none; }
+    button.secondary { background:#64748b; }
+    .muted { color:#64748b; font-size:13px; }
+    .log { background:#0f172a; color:#e2e8f0; padding:8px; border-radius:6px; height:160px; overflow:auto; font-family:monospace; font-size:13px; margin-top:10px; }
+    @media (max-width:600px){ header{flex-direction:column;align-items:flex-start;} }
+  </style>
+  <!-- ethers v5 CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Cross-Border Payments — Demo UI</h1>
+    <div>
+      <button id="connectBtn">Connect Wallet</button>
+      <div id="account" class="muted"></div>
+    </div>
+  </header>
+
+  <section class="card">
+    <label>Router Contract Address</label>
+    <input id="routerAddress" placeholder="0x... (paste deployed MultiCurrencyRouter address)" />
+    <div style="display:flex; gap:8px; margin-top:8px;">
+      <button id="loadRouter">Load Router</button>
+      <button id="refreshAll" class="secondary">Refresh Data</button>
+    </div>
+
+    <div id="routerMeta" style="margin-top:12px; display:none;">
+      <div class="muted">Owner: <span id="routerOwner"></span></div>
+      <div class="muted">Supported: <span id="supportedInfo"></span></div>
+      <div class="muted">Rate (tokenIn → tokenOut): <span id="currentRate">N/A</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>Transfer / Convert</h3>
+
+    <div class="row">
+      <div class="col">
+        <label>Token In (ERC20 address)</label>
+        <input id="tokenIn" placeholder="Token you will send (e.g., mUSD)" />
+        <label>Amount In</label>
+        <input id="amountIn" placeholder="e.g., 100.0" />
+      </div>
+
+      <div class="col">
+        <label>Token Out (ERC20 address)</label>
+        <input id="tokenOut" placeholder="Token you want recipient to receive (e.g., mEUR)" />
+        <label>Recipient Address</label>
+        <input id="recipient" placeholder="0x... (recipient wallet)" />
+      </div>
+    </div>
+
+    <div style="display:flex; gap:8px; margin-top:10px;">
+      <button id="approveBtn">Approve Token In</button>
+      <button id="transferBtn">Cross-Transfer</button>
+      <button id="estimateBtn" class="secondary">Estimate Out</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <div class="muted">Estimated amount out: <strong id="estimateOut">—</strong></div>
+      <div class="muted">Your balances: <span id="balances">—</span></div>
+    </div>
+  </section>
+
+  <section class="card" id="adminCard" style="display:none;">
+    <h3>Admin Controls (owner only)</h3>
+    <label>Set Rate (scaled by 1e18) — e.g. 0.9 → 900000000000000000</label>
+    <input id="adminRate" placeholder="rate scaled 1e18 (big integer)" />
+    <div style="display:flex; gap:8px; margin-top:8px;">
+      <button id="setRateBtn">Set Rate</button>
+      <button id="setSupportedBtn" class="secondary">Toggle Token Supported</button>
+    </div>
+    <label class="muted">Admin actions will revert if connected wallet is not router owner.</label>
+  </section>
+
+  <section class="card">
+    <h3>Quick Notes</h3>
+    <ul>
+      <li class="muted">You must <strong>connect MetaMask</strong> with the account that will sign transactions.</li>
+      <li class="muted">Before calling <em>crossTransfer</em> you should <em>approve</em> the router to spend your tokenIn.</li>
+      <li class="muted">Rate is read from the contract as a fixed-point scaled by 1e18. amountOut = amountIn * rate / 1e18.</li>
+      <li class="muted">For local Hardhat use, run `npx hardhat node` and deploy contracts to that network or deploy locally and paste router address here.</li>
+    </ul>
+  </section>
+
+  <div class="card">
+    <h3>Logs</h3>
+    <div id="log" class="log">UI ready — load router address to start.</div>
+  </div>
+
+<script>
+(async function(){
+  const provider = () => window.ethereum ? new ethers.providers.Web3Provider(window.ethereum) : null;
+  let signer = null;
+  let currentAccount = null;
+  let routerContract = null;
+
+  // Minimal ABIs
+  const erc20Abi = [
+    "function name() view returns (string)",
+    "function symbol() view returns (string)",
+    "function decimals() view returns (uint8)",
+    "function balanceOf(address) view returns (uint256)",
+    "function approve(address spender, uint256 amount) returns (bool)",
+    "function allowance(address owner, address spender) view returns (uint256)",
+    "event Transfer(address indexed from, address indexed to, uint256 value)"
+  ];
+  const routerAbi = [
+    "function setTokenSupported(address token, bool ok) external",
+    "function setRate(address tokenIn, address tokenOut, uint256 rateScaled) external",
+    "function deposit(address token, uint256 amount) external",
+    "function withdraw(address token, uint256 amount, address to) external",
+    "function crossTransfer(address tokenIn, address tokenOut, uint256 amountIn, address recipient) external",
+    "function rate(address,address) view returns (uint256)",
+    "function supportedToken(address) view returns (bool)",
+    "function owner() view returns (address)"
+  ];
+
+  // UI elements
+  const connectBtn = document.getElementById('connectBtn');
+  const accountEl = document.getElementById('account');
+  const routerAddressEl = document.getElementById('routerAddress');
+  const loadRouterBtn = document.getElementById('loadRouter');
+  const routerOwnerEl = document.getElementById('routerOwner');
+  const supportedInfoEl = document.getElementById('supportedInfo');
+  const currentRateEl = document.getElementById('currentRate');
+  const routerMeta = document.getElementById('routerMeta');
+  const tokenInEl = document.getElementById('tokenIn');
+  const tokenOutEl = document.getElementById('tokenOut');
+  const amountInEl = document.getElementById('amountIn');
+  const recipientEl = document.getElementById('recipient');
+  const approveBtn = document.getElementById('approveBtn');
+  const transferBtn = document.getElementById('transferBtn');
+  const estimateBtn = document.getElementById('estimateBtn');
+  const estimateOutEl = document.getElementById('estimateOut');
+  const balancesEl = document.getElementById('balances');
+  const logEl = document.getElementById('log');
+  const refreshAllBtn = document.getElementById('refreshAll');
+
+  // Admin UI
+  const adminCard = document.getElementById('adminCard');
+  const adminRateEl = document.getElementById('adminRate');
+  const setRateBtn = document.getElementById('setRateBtn');
+  const setSupportedBtn = document.getElementById('setSupportedBtn');
+
+  function log(...args){
+    const time = new Date().toLocaleTimeString();
+    logEl.innerText = `${time} — ${args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')}\n` + logEl.innerText;
+  }
+
+  async function ensureWallet(){
+    if (!window.ethereum) { alert('No wallet detected. Install MetaMask.'); return false;}
+    const p = provider();
+    try {
+      await p.send("eth_requestAccounts", []);
+      signer = p.getSigner();
+      currentAccount = await signer.getAddress();
+      accountEl.innerText = `${currentAccount}`;
+      connectBtn.innerText = 'Connected';
+      connectBtn.disabled = true;
+      return true;
+    } catch (err) {
+      log('Wallet connect error', err.message || err);
+      return false;
+    }
+  }
+
+  connectBtn.onclick = async () => {
+    await ensureWallet();
+  };
+
+  loadRouterBtn.onclick = async () => {
+    if (!await ensureWallet()) return;
+    const addr = routerAddressEl.value.trim();
+    if (!addr) { alert('Paste router contract address'); return; }
+    try {
+      routerContract = new ethers.Contract(addr, routerAbi, provider());
+      // read owner
+      const owner = await routerContract.owner();
+      routerOwnerEl.innerText = owner;
+      routerMeta.style.display = 'block';
+
+      // if connected signer is owner show admin
+      const signerAddr = await signer.getAddress();
+      if (signerAddr.toLowerCase() === owner.toLowerCase()){
+        adminCard.style.display = 'block';
+        log('Connected account is owner — admin controls visible.');
+      } else {
+        adminCard.style.display = 'none';
+      }
+      log('Router loaded at', addr);
+      await refreshData();
+    } catch (err) {
+      log('Failed to load router contract:', err.message || err);
+      alert('Failed to load router. Check the address and network.');
+    }
+  };
+
+  async function refreshData(){
+    if (!routerContract) return;
+    const tokenIn = tokenInEl.value.trim();
+    const tokenOut = tokenOutEl.value.trim();
+    try {
+      if (tokenIn && tokenOut){
+        const r = await routerContract.rate(tokenIn, tokenOut);
+        // r is scaled by 1e18
+        const rateFloat = ethers.utils.formatUnits(r, 18);
+        currentRateEl.innerText = `1 tokenIn → ${rateFloat} tokenOut (scaled ${r.toString()})`;
+        // supported info
+        const sIn = await routerContract.supportedToken(tokenIn);
+        const sOut = await routerContract.supportedToken(tokenOut);
+        supportedInfoEl.innerText = `In:${sIn} Out:${sOut}`;
+        // estimate out if amount present
+        const amt = amountInEl.value.trim();
+        if (amt) await estimateOut();
+      } else {
+        currentRateEl.innerText = 'Set tokenIn and tokenOut addresses to read rate';
+      }
+      // balances
+      await refreshBalances();
+    } catch (err) {
+      log('refreshData error:', err.message || err);
+    }
+  }
+
+  async function refreshBalances(){
+    try {
+      const addr = await signer.getAddress();
+      const tokenIn = tokenInEl.value.trim();
+      const tokenOut = tokenOutEl.value.trim();
+      let parts = [];
+      if (tokenIn){
+        const t = new ethers.Contract(tokenIn, erc20Abi, provider());
+        const dec = await t.decimals();
+        const b = await t.balanceOf(addr);
+        parts.push(`${await t.symbol()} = ${ethers.utils.formatUnits(b, dec)}`);
+      }
+      if (tokenOut){
+        const t2 = new ethers.Contract(tokenOut, erc20Abi, provider());
+        const dec2 = await t2.decimals();
+        const b2 = await t2.balanceOf(addr);
+        parts.push(`${await t2.symbol()} = ${ethers.utils.formatUnits(b2, dec2)}`);
+      }
+      balancesEl.innerText = parts.length ? parts.join(' • ') : 'Token fields empty';
+    } catch (err) {
+      // ignore if tokens not set
+      balancesEl.innerText = 'Could not load balances (check token addresses & network)';
+    }
+  }
+
+  async function estimateOut(){
+    try {
+      const tokenIn = tokenInEl.value.trim();
+      const tokenOut = tokenOutEl.value.trim();
+      const amt = amountInEl.value.trim();
+      if (!tokenIn || !tokenOut || !amt) { estimateOutEl.innerText = '—'; return; }
+      const r = await routerContract.rate(tokenIn, tokenOut); // scaled 1e18
+      const tIn = new ethers.Contract(tokenIn, erc20Abi, provider());
+      const dec = await tIn.decimals();
+      const amountInBN = ethers.utils.parseUnits(amt, dec);
+      // amountOut = amountIn * r / 1e18
+      const amountOutBN = amountInBN.mul(r).div(ethers.BigNumber.from("1000000000000000000"));
+      // display using tokenOut decimals
+      const tOut = new ethers.Contract(tokenOut, erc20Abi, provider());
+      const decOut = await tOut.decimals();
+      estimateOutEl.innerText = ethers.utils.formatUnits(amountOutBN, decOut);
+      return amountOutBN;
+    } catch (err) {
+      estimateOutEl.innerText = 'error';
+      log('estimate error', err.message || err);
+    }
+  }
+
+  estimateBtn.onclick = async () => {
+    if (!routerContract) { alert('Load router first'); return; }
+    await estimateOut();
+  };
+
+  approveBtn.onclick = async () => {
+    if (!await ensureWallet()) return;
+    const tokenIn = tokenInEl.value.trim();
+    const routerAddr = routerAddressEl.value.trim();
+    const amt = amountInEl.value.trim();
+    if (!tokenIn || !routerAddr || !amt) { alert('Fill tokenIn, router and amount'); return; }
+
+    try {
+      const t = new ethers.Contract(tokenIn, erc20Abi, provider()).connect(signer);
+      const dec = await t.decimals();
+      const amountBN = ethers.utils.parseUnits(amt, dec);
+      log('Sending approve for', ethers.utils.formatUnits(amountBN, dec));
+      const tx = await t.approve(routerAddr, amountBN);
+      log('Approve tx submitted:', tx.hash);
+      await tx.wait();
+      log('Approve confirmed');
+      // check allowance
+      const allowance = await t.allowance(await signer.getAddress(), routerAddr);
+      log('Allowance to router:', ethers.utils.formatUnits(allowance, dec));
+    } catch (err) {
+      log('Approve failed:', err.message || err);
+      alert('Approve failed: ' + (err.message || err));
+    }
+    await refreshBalances();
+  };
+
+  transferBtn.onclick = async () => {
+    if (!await ensureWallet()) return;
+    if (!routerContract) { alert('Load router first'); return; }
+    const tokenIn = tokenInEl.value.trim();
+    const tokenOut = tokenOutEl.value.trim();
+    const amt = amountInEl.value.trim();
+    const recipient = recipientEl.value.trim();
+    if (!tokenIn || !tokenOut || !amt || !recipient) { alert('Fill all fields'); return; }
+
+    try {
+      const tIn = new ethers.Contract(tokenIn, erc20Abi, provider());
+      const decIn = await tIn.decimals();
+      const amountBN = ethers.utils.parseUnits(amt, decIn);
+
+      // optional: check allowance and warn
+      const allowance = await tIn.allowance(await signer.getAddress(), routerContract.address);
+      if (allowance.lt(amountBN)) {
+        if (!confirm('Router has insufficient allowance. Approve now?')) return;
+        const approveTx = await tIn.connect(signer).approve(routerContract.address, amountBN);
+        log('Approve tx', approveTx.hash);
+        await approveTx.wait();
+        log('Approve done');
+      }
+
+      const routerWithSigner = routerContract.connect(signer);
+      log('Sending crossTransfer...');
+      const tx = await routerWithSigner.crossTransfer(tokenIn, tokenOut, amountBN, recipient);
+      log('Tx submitted:', tx.hash);
+      await tx.wait();
+      log('CrossTransfer confirmed', tx.hash);
+      await refreshData();
+    } catch (err) {
+      log('crossTransfer error:', (err && err.error && err.error.message) || err.message || err);
+      alert('Transfer failed: ' + (err.message || err));
+    }
+  };
+
+  // Admin actions
+  setRateBtn.onclick = async () => {
+    if (!routerContract) { alert('Load router first'); return; }
+    if (!await ensureWallet()) return;
+    const r = adminRateEl.value.trim();
+    const tokenIn = tokenInEl.value.trim();
+    const tokenOut = tokenOutEl.value.trim();
+    if (!r || !tokenIn || !tokenOut) return alert('Set tokenIn/tokenOut and rate');
+    try {
+      const tx = await routerContract.connect(signer).setRate(tokenIn, tokenOut, ethers.BigNumber.from(r));
+      log('setRate tx', tx.hash);
+      await tx.wait();
+      log('Rate set');
+      await refreshData();
+    } catch (err) {
+      log('setRate failed', err.message || err);
+      alert('setRate failed: ' + (err.message || err));
+    }
+  };
+
+  setSupportedBtn.onclick = async () => {
+    if (!routerContract) { alert('Load router first'); return; }
+    if (!await ensureWallet()) return;
+    const token = tokenInEl.value.trim();
+    if (!token) return alert('Enter token address in Token In field to toggle supported');
+    try {
+      // read current
+      const current = await routerContract.supportedToken(token);
+      const tx = await routerContract.connect(signer).setTokenSupported(token, !current);
+      log('toggle supported tx', tx.hash);
+      await tx.wait();
+      log('Supported toggled to', !current);
+      await refreshData();
+    } catch (err) {
+      log('toggle failed', err.message || err);
+      alert('toggle failed: ' + (err.message || err));
+    }
+  };
+
+  refreshAllBtn.onclick = refreshData;
+
+  // attempt to auto-connect if already authorized
+  if (window.ethereum && window.ethereum.selectedAddress) {
+    try { await ensureWallet(); } catch(e) {}
+  }
+
+  // listen for account changes
+  if (window.ethereum) {
+    window.ethereum.on('accountsChanged', (accounts) => {
+      if (accounts.length === 0) {
+        accountEl.innerText = 'Not connected';
+        connectBtn.disabled = false;
+        connectBtn.innerText = 'Connect Wallet';
+      } else {
+        accountEl.innerText = accounts[0];
+        connectBtn.disabled = true;
+        connectBtn.innerText = 'Connected';
+      }
+    });
+    window.ethereum.on('chainChanged', () => { window.location.reload(); });
+  }
+})();
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Blockchain Cross-Border Payments</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f5f5f5;
+      padding: 20px;
+    }
+    .container {
+      max-width: 500px;
+      margin: auto;
+      background: white;
+      padding: 20px;
+      border-radius: 10px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+    h2 { text-align: center; }
+    label { display: block; margin-top: 10px; }
+    input, select, button {
+      width: 100%; padding: 10px; margin-top: 5px;
+      border: 1px solid #ccc; border-radius: 5px;
+    }
+    button {
+      background: #4CAF50; color: white; font-weight: bold; cursor: pointer;
+    }
+    button:hover { background: #45a049; }
+    .status { margin-top: 15px; font-weight: bold; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Cross-Border Payment</h2>
+    
+    <label for="receiver">Receiver Address:</label>
+    <input type="text" id="receiver" placeholder="0x... Ethereum Address" />
+
+    <label for="currency">Currency:</label>
+    <select id="currency">
+      <option value="USD">USD Stablecoin</option>
+      <option value="EUR">EUR Stablecoin</option>
+    </select>
+
+    <label for="amount">Amount:</label>
+    <input type="number" id="amount" placeholder="Enter amount" />
+
+    <button onclick="sendPayment()">Send Payment</button>
+
+    <div class="status" id="status"></div>
+  </div>
+
+  <script>
+    async function sendPayment() {
+      if (!window.ethereum) {
+        alert("Please install MetaMask!");
+        return;
+      }
+      const provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      const signer = provider.getSigner();
+
+      const receiver = document.getElementById("receiver").value;
+      const currency = document.getElementById("currency").value;
+      const amount = document.getElementById("amount").value;
+      
+      // For now, just simulate (later we connect to smart contract)
+      document.getElementById("status").innerText =
+        `Simulated sending ${amount} ${currency} to ${receiver}`;
+    }
+  </script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Blockchain Cross-Border Payments</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: linear-gradient(135deg, #74ebd5, #ACB6E5);
+      padding: 20px;
+    }
+    .container {
+      max-width: 1000px;
+      margin: auto;
+      background: white;
+      padding: 30px;
+      border-radius: 15px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.2);
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 30px;
+      animation: fadeIn 1.2s ease-in-out;
+    }
+    h2 {
+      text-align: center;
+      grid-column: span 2;
+      color: #333;
+      margin-bottom: 10px;
+    }
+    label { display: block; margin-top: 10px; font-weight: bold; }
+    input, select, button {
+      width: 100%;
+      padding: 12px;
+      margin-top: 5px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      transition: all 0.3s ease;
+    }
+    input:focus, select:focus {
+      border-color: #4CAF50;
+      outline: none;
+      box-shadow: 0 0 8px rgba(76,175,80,0.3);
+    }
+    button {
+      background: #4CAF50; 
+      color: white; 
+      font-weight: bold; 
+      cursor: pointer;
+      margin-top: 15px;
+    }
+    button:hover { background: #45a049; transform: scale(1.03); }
+    .status {
+      margin-top: 15px; 
+      font-weight: bold; 
+      text-align: center;
+      color: #444;
+      grid-column: span 2;
+      animation: fadeIn 0.8s ease-in-out;
+    }
+    .card {
+      background: #fafafa;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      animation: slideUp 1s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes slideUp {
+      from { transform: translateY(30px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>🌍 Cross-Border Payment DApp</h2>
+    
+    <!-- Left side: Payment Form -->
+    <div class="card">
+      <h3>Send Payment</h3>
+      <label for="receiver">Receiver Address:</label>
+      <input type="text" id="receiver" placeholder="0x... Ethereum Address" />
+
+      <label for="currency">Currency:</label>
+      <select id="currency">
+        <option value="USD">USD Stablecoin</option>
+        <option value="EUR">EUR Stablecoin</option>
+      </select>
+
+      <label for="amount">Amount:</label>
+      <input type="number" id="amount" placeholder="Enter amount" />
+
+      <button onclick="sendPayment()">Send Payment</button>
+    </div>
+
+    <!-- Right side: INR to USD conversion -->
+    <div class="card">
+      <h3>💱 INR → USD Conversion</h3>
+      <label for="inrAmount">Amount in INR:</label>
+      <input type="number" id="inrAmount" placeholder="Enter INR" oninput="convertInrToUsd()" />
+
+      <label for="usdAmount">Equivalent in USD:</label>
+      <input type="text" id="usdAmount" readonly />
+    </div>
+
+    <!-- Status -->
+    <div class="status" id="status"></div>
+  </div>
+
+  <script>
+    // Temporary conversion rate (1 INR = 0.012 USD approx)
+    const INR_TO_USD = 0.012;
+
+    function convertInrToUsd() {
+      let inr = document.getElementById("inrAmount").value;
+      let usd = (inr * INR_TO_USD).toFixed(2);
+      document.getElementById("usdAmount").value = usd;
+    }
+
+    async function sendPayment() {
+      if (!window.ethereum) {
+        alert("Please install MetaMask!");
+        return;
+      }
+
+      const provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      const signer = provider.getSigner();
+
+      const receiver = document.getElementById("receiver").value;
+      const currency = document.getElementById("currency").value;
+      const amount = document.getElementById("amount").value;
+
+      // For now, just simulate
+      document.getElementById("status").innerText =
+        `Simulated sending ${amount} ${currency} to ${receiver}`;
+    }
+  </script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Blockchain Cross-Border Payments</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: linear-gradient(135deg, #74ebd5, #ACB6E5);
+      padding: 20px;
+      margin: 0;
+    }
+    .container {
+      max-width: 1200px;
+      margin: auto;
+      background: white;
+      padding: 30px;
+      border-radius: 15px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.2);
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 30px;
+      animation: fadeIn 1.2s ease-in-out;
+    }
+    h2 {
+      text-align: center;
+      grid-column: span 2;
+      color: #333;
+      margin-bottom: 20px;
+    }
+    h3 { margin-bottom: 10px; color: #444; }
+    label { display: block; margin-top: 10px; font-weight: bold; }
+    input, select, button {
+      width: 100%;
+      padding: 12px;
+      margin-top: 5px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      transition: all 0.3s ease;
+    }
+    input:focus, select:focus {
+      border-color: #4CAF50;
+      outline: none;
+      box-shadow: 0 0 8px rgba(76,175,80,0.3);
+    }
+    button {
+      background: #4CAF50; 
+      color: white; 
+      font-weight: bold; 
+      cursor: pointer;
+      margin-top: 15px;
+    }
+    button:hover { background: #45a049; transform: scale(1.03); }
+    .status {
+      margin-top: 15px; 
+      font-weight: bold; 
+      text-align: center;
+      color: #444;
+      grid-column: span 2;
+      animation: fadeIn 0.8s ease-in-out;
+    }
+    .card {
+      background: #fafafa;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      animation: slideUp 1s ease;
+    }
+    .full {
+      grid-column: span 2;
+    }
+    ul {
+      margin: 10px 0;
+      padding-left: 20px;
+    }
+    .history-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    .history-table th, .history-table td {
+      border: 1px solid #ccc;
+      padding: 10px;
+      text-align: center;
+    }
+    .footer {
+      margin-top: 40px;
+      text-align: center;
+      color: #555;
+      font-size: 14px;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes slideUp {
+      from { transform: translateY(30px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>🌍 Cross-Border Payment DApp</h2>
+    
+    <!-- Left side: Payment Form -->
+    <div class="card">
+      <h3>Send Payment</h3>
+      <label for="receiver">Receiver Address:</label>
+      <input type="text" id="receiver" placeholder="0x... Ethereum Address" />
+
+      <label for="currency">Currency:</label>
+      <select id="currency">
+        <option value="USD">USD Stablecoin</option>
+        <option value="EUR">EUR Stablecoin</option>
+      </select>
+
+      <label for="amount">Amount:</label>
+      <input type="number" id="amount" placeholder="Enter amount" />
+
+      <button onclick="sendPayment()">Send Payment</button>
+    </div>
+
+    <!-- Right side: INR to USD conversion -->
+    <div class="card">
+      <h3>💱 INR → USD Conversion</h3>
+      <label for="inrAmount">Amount in INR:</label>
+      <input type="number" id="inrAmount" placeholder="Enter INR" oninput="convertInrToUsd()" />
+
+      <label for="usdAmount">Equivalent in USD:</label>
+      <input type="text" id="usdAmount" readonly />
+    </div>
+
+    <!-- About Section -->
+    <div class="card full">
+      <h3>About This DApp</h3>
+      <p>
+        This decentralized application (DApp) demonstrates a blockchain-based cross-border payment system. 
+        It allows users to send stablecoins (USD/EUR) across borders instantly, with full transparency and 
+        lower fees compared to traditional banks.
+      </p>
+    </div>
+
+    <!-- Features Section -->
+    <div class="card full">
+      <h3>⚡ Key Features</h3>
+      <ul>
+        <li>Send payments globally with stablecoins (USD/EUR).</li>
+        <li>Transparent, secure, and immutable blockchain transactions.</li>
+        <li>Role-based access: Borrowers, lenders, and remitters.</li>
+        <li>Conversion tool for INR to USD estimation.</li>
+        <li>Mobile-friendly, responsive design.</li>
+      </ul>
+    </div>
+
+    <!-- Transaction History -->
+    <div class="card full">
+      <h3>📜 Recent Transactions</h3>
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Sender</th>
+            <th>Receiver</th>
+            <th>Currency</th>
+            <th>Amount</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="history">
+          <tr>
+            <td>0xAlice</td>
+            <td>0xBob</td>
+            <td>USD</td>
+            <td>100</td>
+            <td>✅ Completed</td>
+          </tr>
+          <tr>
+            <td>0xCharlie</td>
+            <td>0xDave</td>
+            <td>EUR</td>
+            <td>250</td>
+            <td>✅ Completed</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Status -->
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="footer">
+    🌐 Blockchain Payments Prototype | Built for Learning Purposes
+  </div>
+
+  <script>
+    // Temporary conversion rate (1 INR = 0.012 USD approx)
+    const INR_TO_USD = 0.012;
+
+    function convertInrToUsd() {
+      let inr = document.getElementById("inrAmount").value;
+      let usd = (inr * INR_TO_USD).toFixed(2);
+      document.getElementById("usdAmount").value = usd;
+    }
+
+    async function sendPayment() {
+      if (!window.ethereum) {
+        alert("Please install MetaMask!");
+        return;
+      }
+
+      const provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      const signer = provider.getSigner();
+
+      const receiver = document.getElementById("receiver").value;
+      const currency = document.getElementById("currency").value;
+      const amount = document.getElementById("amount").value;
+
+      // For now, just simulate
+      document.getElementById("status").innerText =
+        `Simulated sending ${amount} ${currency} to ${receiver}`;
+
+      // Also add to transaction history (just demo)
+      let history = document.getElementById("history");
+      let newRow = `<tr>
+          <td>You</td>
+          <td>${receiver}</td>
+          <td>${currency}</td>
+          <td>${amount}</td>
+          <td>⏳ Pending</td>
+        </tr>`;
+      history.innerHTML += newRow;
+    }
+  </script>
+</body>
+</html>
+<script>
+  async function convertInrToUsd() {
+    let inr = document.getElementById("inrAmount").value;
+
+    if (!inr) {
+      document.getElementById("usdAmount").value = "";
+      return;
+    }
+
+    try {
+      // Fetch live INR to USD rate
+      let res = await fetch("https://api.exchangerate.host/convert?from=INR&to=USD");
+      let data = await res.json();
+      let rate = data.result;
+
+      let usd = (inr * rate).toFixed(2);
+      document.getElementById("usdAmount").value = usd;
+    } catch (err) {
+      console.error("Conversion error:", err);
+      document.getElementById("usdAmount").value = "Error fetching rate";
+    }
+  }
+</script>
+<script>
+  const ROUTER_ADDRESS = "0xYourRouterAddress"; 
+  const USD_TOKEN = "0xYourUSDTokenAddress"; 
+  const EUR_TOKEN = "0xYourEURTokenAddress";
+
+  const routerABI = [
+    "function transferStablecoin(address token, address to, uint256 amount) public"
+  ];
+
+  async function sendPayment() {
+    if (!window.ethereum) {
+      alert("Please install MetaMask!");
+      return;
+    }
+
+    const provider = new ethers.providers.Web3Provider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);
+    const signer = provider.getSigner();
+
+    const receiver = document.getElementById("receiver").value;
+    const currency = document.getElementById("currency").value;
+    const amount = document.getElementById("amount").value;
+
+    let tokenAddress = currency === "USD" ? USD_TOKEN : EUR_TOKEN;
+
+    const router = new ethers.Contract(ROUTER_ADDRESS, routerABI, signer);
+
+    try {
+      const tx = await router.transferStablecoin(
+        tokenAddress,
+        receiver,
+        ethers.utils.parseUnits(amount, 18)
+      );
+
+      document.getElementById("status").innerText = "Transaction sent ⏳...";
+      await tx.wait();
+      document.getElementById("status").innerText = `✅ Sent ${amount} ${currency} to ${receiver}`;
+    } catch (err) {
+      console.error(err);
+      document.getElementById("status").innerText = "❌ Transaction failed";
+    }
+  }
+</script>
